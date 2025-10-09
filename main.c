@@ -1,4 +1,4 @@
-// main.c
+// main.c (cJSON-based rewrite)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,9 +8,10 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <curl/curl.h>
+#include <cjson/cJSON.h>
 
 #define PORT 8080
-#define BUFFER_SIZE 8192 // Increased for larger responses
+#define BUFFER_SIZE 8192
 
 struct MemoryStruct {
     char *memory;
@@ -21,217 +22,297 @@ static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, voi
     size_t realsize = size * nmemb;
     struct MemoryStruct *mem = (struct MemoryStruct *)userp;
     char *ptr = realloc(mem->memory, mem->size + realsize + 1);
-    if (ptr == NULL) {
-        return 0;
-    }
+    if (!ptr) return 0;
     mem->memory = ptr;
     memcpy(&(mem->memory[mem->size]), contents, realsize);
-    mem->size += mem->size + realsize;
+    mem->size += realsize;
     mem->memory[mem->size] = 0;
     return realsize;
 }
 
-// Recursive file list function
-void list_files_recursively(const char *base_path, char *buffer, size_t *buf_size, size_t max_size) {
+void list_files_recursively(const char *base_path, cJSON *array) {
     DIR *dir = opendir(base_path);
-    if (!dir) {
-        return;
-    }
+    if (!dir) return;
     struct dirent *entry;
+
     while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
             continue;
-        }
+
         char path[1024];
         snprintf(path, sizeof(path), "%s/%s", base_path, entry->d_name);
-        size_t len = strlen(path);
-        if (*buf_size + len + 2 < max_size) {
-            strcat(buffer, path);
-            strcat(buffer, "\n");
-            *buf_size += len + 1;
-        }
+
+        cJSON_AddItemToArray(array, cJSON_CreateString(path));
+
         if (entry->d_type == DT_DIR) {
-            list_files_recursively(path, buffer + *buf_size, buf_size, max_size);
+            list_files_recursively(path, array);
         }
     }
     closedir(dir);
 }
 
-// Send JSON-RPC response
-void send_jsonrpc_response(int client_socket, const char* result, int id) {
-    char response[BUFFER_SIZE];
-    snprintf(response, sizeof(response),
-             "{\"jsonrpc\":\"2.0\",\"result\":%s,\"id\":%d}\n",
-             result, id);
-    write(client_socket, response, strlen(response));
+void send_json(int client_socket, cJSON *obj) {
+    char *json_str = cJSON_PrintUnformatted(obj);
+    write(client_socket, json_str, strlen(json_str));
+    write(client_socket, "\n", 1);
+    free(json_str);
 }
 
-// Send JSON-RPC error
-void send_jsonrpc_error(int client_socket, int code, const char* message, int id) {
-    char response[BUFFER_SIZE];
-    snprintf(response, sizeof(response),
-             "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":%d,\"message\":\"%s\"},\"id\":%d}\n",
-             code, message, id);
-    write(client_socket, response, strlen(response));
+void send_jsonrpc_response(int client_socket, cJSON *result, int id) {
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "jsonrpc", "2.0");
+    cJSON_AddItemToObject(resp, "result", result);
+    cJSON_AddNumberToObject(resp, "id", id);
+    send_json(client_socket, resp);
+    cJSON_Delete(resp);
 }
 
-// Handle client request
-void handle_request(int client_socket, const char* buffer) {
-    char method[64] = {0};
-    int id = 0;
-    sscanf(buffer, "%*[^i]\"id\":%d", &id);
-    sscanf(buffer, "%*[^m]\"method\":\"%[^\"]\"", method);
+void send_jsonrpc_error(int client_socket, int code, const char *message, int id) {
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "jsonrpc", "2.0");
+    cJSON *err = cJSON_CreateObject();
+    cJSON_AddNumberToObject(err, "code", code);
+    cJSON_AddStringToObject(err, "message", message);
+    cJSON_AddItemToObject(resp, "error", err);
+    cJSON_AddNumberToObject(resp, "id", id);
+    send_json(client_socket, resp);
+    cJSON_Delete(resp);
+}
 
-    if (strcmp(method, "initialize") == 0) {
-        const char* capabilities = "{\"capabilities\":{\"tools\":{\"listChanged\":true}}}";
-        send_jsonrpc_response(client_socket, capabilities, id);
+void handle_request(int client_socket, const char *buffer) {
+    cJSON *root = cJSON_Parse(buffer);
+    if (!root) {
+        send_jsonrpc_error(client_socket, -32700, "Parse error", 0);
         return;
     }
 
-    if (strcmp(method, "tools/list") == 0) {
-        const char* tools = "["
-            "{\"name\":\"read_file\",\"description\":\"Read the content of a file\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}},"
-            "{\"name\":\"recursive_file_list\",\"description\":\"List files recursively in a directory\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}},"
-            "{\"name\":\"call_llm\",\"description\":\"Call x.ai Grok API for chat completion\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\"},\"model\":{\"type\":\"string\",\"default\":\"grok-4\"},\"max_tokens\":{\"type\":\"number\",\"default\":512}},\"required\":[\"prompt\"]}}"
-            "]";
+    cJSON *method = cJSON_GetObjectItemCaseSensitive(root, "method");
+    cJSON *id_item = cJSON_GetObjectItemCaseSensitive(root, "id");
+    int id = id_item ? id_item->valueint : 0;
+
+    if (!cJSON_IsString(method)) {
+        send_jsonrpc_error(client_socket, -32600, "Invalid Request", id);
+        cJSON_Delete(root);
+        return;
+    }
+
+    const char *method_name = method->valuestring;
+
+    // initialize
+    if (!strcmp(method_name, "initialize")) {
+        cJSON *capabilities = cJSON_CreateObject();
+        cJSON *tools = cJSON_CreateObject();
+        cJSON_AddBoolToObject(tools, "listChanged", 1);
+        cJSON_AddItemToObject(capabilities, "tools", tools);
+        cJSON *result = cJSON_CreateObject();
+        cJSON_AddItemToObject(result, "capabilities", capabilities);
+        send_jsonrpc_response(client_socket, result, id);
+        return;
+    }
+
+    // tools/list
+    if (!strcmp(method_name, "tools/list")) {
+        cJSON *tools = cJSON_CreateArray();
+
+        cJSON *t1 = cJSON_CreateObject();
+        cJSON_AddStringToObject(t1, "name", "read_file");
+        cJSON_AddStringToObject(t1, "description", "Read the content of a file");
+        cJSON_AddItemToArray(tools, t1);
+
+        cJSON *t2 = cJSON_CreateObject();
+        cJSON_AddStringToObject(t2, "name", "recursive_file_list");
+        cJSON_AddStringToObject(t2, "description", "List files recursively in a directory");
+        cJSON_AddItemToArray(tools, t2);
+
+        cJSON *t3 = cJSON_CreateObject();
+        cJSON_AddStringToObject(t3, "name", "call_llm");
+        cJSON_AddStringToObject(t3, "description", "Call x.ai Grok API for chat completion");
+        cJSON_AddItemToArray(tools, t3);
+
         send_jsonrpc_response(client_socket, tools, id);
+        cJSON_Delete(root);
         return;
     }
 
-    if (strcmp(method, "tools/call") == 0) {
-        char name[64] = {0};
-        char args[BUFFER_SIZE] = {0};
-        char *args_start = strstr(buffer, "\"arguments\":");
-        if (args_start) {
-            sscanf(buffer, "%*[^n]\"name\":\"%[^\"]\"", name);
-            // Copy arguments string
-            args_start += 12; // Skip "\"arguments\":"
-            char *args_end = strrchr(args_start, '}');
-            if (args_end) {
-                strncpy(args, args_start, args_end - args_start + 1);
-                args[args_end - args_start + 1] = '\0';
-            }
-        } else {
+    // tools/call
+    if (!strcmp(method_name, "tools/call")) {
+        cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
+        cJSON *name_item = cJSON_GetObjectItemCaseSensitive(params, "name");
+        cJSON *args = cJSON_GetObjectItemCaseSensitive(params, "arguments");
+
+        if (!cJSON_IsString(name_item) || !cJSON_IsObject(args)) {
             send_jsonrpc_error(client_socket, -32602, "Invalid params", id);
+            cJSON_Delete(root);
             return;
         }
 
-        if (strcmp(name, "read_file") == 0) {
-            char path[256] = {0};
-            sscanf(args, "%*[^p]\"path\":\"%255[^\"]\"", path);
-            // Security: Prefix with ./data/ to restrict access
+        const char *name = name_item->valuestring;
+
+        // --- read_file ---
+        if (!strcmp(name, "read_file")) {
+            cJSON *path_item = cJSON_GetObjectItemCaseSensitive(args, "path");
+            if (!cJSON_IsString(path_item)) {
+                send_jsonrpc_error(client_socket, -32602, "Missing path", id);
+                cJSON_Delete(root);
+                return;
+            }
             char safe_path[512];
-            snprintf(safe_path, sizeof(safe_path), "./data/%s", path);
+            snprintf(safe_path, sizeof(safe_path), "./data/%s", path_item->valuestring);
+
             FILE *file = fopen(safe_path, "r");
             if (!file) {
                 send_jsonrpc_error(client_socket, -32000, "File not found", id);
+                cJSON_Delete(root);
                 return;
             }
-            char file_content[BUFFER_SIZE] = {0};
-            size_t len = fread(file_content, 1, sizeof(file_content) - 1, file);
+
+            char *content = malloc(BUFFER_SIZE);
+            size_t len = fread(content, 1, BUFFER_SIZE - 1, file);
             fclose(file);
-            char result[BUFFER_SIZE];
-            snprintf(result, sizeof(result), "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}", file_content);
+            content[len] = '\0';
+
+            cJSON *result = cJSON_CreateObject();
+            cJSON *content_arr = cJSON_CreateArray();
+            cJSON *entry = cJSON_CreateObject();
+            cJSON_AddStringToObject(entry, "type", "text");
+            cJSON_AddStringToObject(entry, "text", content);
+            cJSON_AddItemToArray(content_arr, entry);
+            cJSON_AddItemToObject(result, "content", content_arr);
             send_jsonrpc_response(client_socket, result, id);
+            free(content);
+            cJSON_Delete(root);
             return;
         }
 
-        if (strcmp(name, "recursive_file_list") == 0) {
-            char path[256] = {0};
-            sscanf(args, "%*[^p]\"path\":\"%255[^\"]\"", path);
+        // --- recursive_file_list ---
+        if (!strcmp(name, "recursive_file_list")) {
+            cJSON *path_item = cJSON_GetObjectItemCaseSensitive(args, "path");
+            if (!cJSON_IsString(path_item)) {
+                send_jsonrpc_error(client_socket, -32602, "Missing path", id);
+                cJSON_Delete(root);
+                return;
+            }
             char safe_path[512];
-            snprintf(safe_path, sizeof(safe_path), "./data/%s", path);
-            char list_buffer[BUFFER_SIZE] = {0};
-            size_t buf_size = 0;
-            list_files_recursively(safe_path, list_buffer, &buf_size, sizeof(list_buffer));
-            char result[BUFFER_SIZE];
-            snprintf(result, sizeof(result), "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}", list_buffer);
+            snprintf(safe_path, sizeof(safe_path), "./data/%s", path_item->valuestring);
+
+            cJSON *file_list = cJSON_CreateArray();
+            list_files_recursively(safe_path, file_list);
+
+            cJSON *result = cJSON_CreateObject();
+            cJSON *content_arr = cJSON_CreateArray();
+            cJSON *entry = cJSON_CreateObject();
+            cJSON_AddStringToObject(entry, "type", "text");
+            char *list_str = cJSON_PrintUnformatted(file_list);
+            cJSON_AddStringToObject(entry, "text", list_str);
+            cJSON_AddItemToArray(content_arr, entry);
+            cJSON_AddItemToObject(result, "content", content_arr);
             send_jsonrpc_response(client_socket, result, id);
+            free(list_str);
+            cJSON_Delete(file_list);
+            cJSON_Delete(root);
             return;
         }
 
-        if (strcmp(name, "call_llm") == 0) {
-            char prompt[2048] = {0};
-            char model[32] = "grok-4";
-            int max_tokens = 512;
-            sscanf(args, "%*[^p]\"prompt\":\"%2047[^\"]\"", prompt);
-            char *model_start = strstr(args, "\"model\":");
-            if (model_start) sscanf(model_start, "\"model\":\"%31[^\"]\"", model);
-            char *tokens_start = strstr(args, "\"max_tokens\":");
-            if (tokens_start) sscanf(tokens_start, "\"max_tokens\":%d", &max_tokens);
+        // --- call_llm ---
+        if (!strcmp(name, "call_llm")) {
+            cJSON *prompt_item = cJSON_GetObjectItemCaseSensitive(args, "prompt");
+            cJSON *model_item = cJSON_GetObjectItemCaseSensitive(args, "model");
+            cJSON *tokens_item = cJSON_GetObjectItemCaseSensitive(args, "max_tokens");
+
+            if (!cJSON_IsString(prompt_item)) {
+                send_jsonrpc_error(client_socket, -32602, "Missing prompt", id);
+                cJSON_Delete(root);
+                return;
+            }
+
+            const char *prompt = prompt_item->valuestring;
+            const char *model = model_item && cJSON_IsString(model_item) ? model_item->valuestring : "grok-4";
+            int max_tokens = tokens_item && cJSON_IsNumber(tokens_item) ? tokens_item->valueint : 512;
 
             const char *api_key = getenv("XAI_API_KEY");
-            if (!api_key || strlen(api_key) == 0) {
+            if (!api_key || !strlen(api_key)) {
                 send_jsonrpc_error(client_socket, -32000, "XAI_API_KEY not set", id);
+                cJSON_Delete(root);
                 return;
             }
 
             CURL *curl = curl_easy_init();
             if (!curl) {
                 send_jsonrpc_error(client_socket, -32000, "CURL init failed", id);
+                cJSON_Delete(root);
                 return;
             }
 
-            struct MemoryStruct chunk;
-            chunk.memory = malloc(1);
-            chunk.size = 0;
+            struct MemoryStruct chunk = {malloc(1), 0};
 
-            char data[BUFFER_SIZE];
-            snprintf(data, sizeof(data), "{\"model\":\"%s\",\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}],\"max_tokens\":%d}", model, prompt, max_tokens);
+            cJSON *payload = cJSON_CreateObject();
+            cJSON_AddStringToObject(payload, "model", model);
+            cJSON *messages = cJSON_CreateArray();
+            cJSON *msg = cJSON_CreateObject();
+            cJSON_AddStringToObject(msg, "role", "user");
+            cJSON_AddStringToObject(msg, "content", prompt);
+            cJSON_AddItemToArray(messages, msg);
+            cJSON_AddItemToObject(payload, "messages", messages);
+            cJSON_AddNumberToObject(payload, "max_tokens", max_tokens);
+            char *data = cJSON_PrintUnformatted(payload);
+            cJSON_Delete(payload);
 
             curl_easy_setopt(curl, CURLOPT_URL, "https://api.x.ai/v1/chat/completions");
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
-
             struct curl_slist *headers = NULL;
             headers = curl_slist_append(headers, "Content-Type: application/json");
             char auth[256];
             snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key);
             headers = curl_slist_append(headers, auth);
             curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
             curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
 
             CURLcode res = curl_easy_perform(curl);
+            free(data);
+
             if (res != CURLE_OK) {
                 send_jsonrpc_error(client_socket, -32000, "API call failed", id);
-                free(chunk.memory);
-                curl_slist_free_all(headers);
-                curl_easy_cleanup(curl);
-                return;
-            }
-
-            // Crude parse for content
-            char *content_start = strstr(chunk.memory, "\"content\":\"");
-            char llm_response[2048] = {0};
-            if (content_start) {
-                content_start += 11;
-                char *content_end = strchr(content_start, '\"');
-                if (content_end) {
-                    strncpy(llm_response, content_start, content_end - content_start);
-                    llm_response[content_end - content_start] = '\0';
+            } else {
+                cJSON *api_resp = cJSON_Parse(chunk.memory);
+                const char *llm_text = "(no response)";
+                if (api_resp) {
+                    cJSON *choices = cJSON_GetObjectItem(api_resp, "choices");
+                    if (cJSON_IsArray(choices)) {
+                        cJSON *first = cJSON_GetArrayItem(choices, 0);
+                        cJSON *message = cJSON_GetObjectItem(first, "message");
+                        cJSON *content = cJSON_GetObjectItem(message, "content");
+                        if (cJSON_IsString(content)) llm_text = content->valuestring;
+                    }
                 }
+
+                cJSON *result = cJSON_CreateObject();
+                cJSON *content_arr = cJSON_CreateArray();
+                cJSON *entry = cJSON_CreateObject();
+                cJSON_AddStringToObject(entry, "type", "text");
+                cJSON_AddStringToObject(entry, "text", llm_text);
+                cJSON_AddItemToArray(content_arr, entry);
+                cJSON_AddItemToObject(result, "content", content_arr);
+                send_jsonrpc_response(client_socket, result, id);
+                if (api_resp) cJSON_Delete(api_resp);
             }
-
-            char result[BUFFER_SIZE];
-            snprintf(result, sizeof(result), "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}", llm_response);
-
-            send_jsonrpc_response(client_socket, result, id);
 
             free(chunk.memory);
             curl_slist_free_all(headers);
             curl_easy_cleanup(curl);
+            cJSON_Delete(root);
             return;
         }
 
         send_jsonrpc_error(client_socket, -32601, "Tool not found", id);
+        cJSON_Delete(root);
         return;
     }
 
     send_jsonrpc_error(client_socket, -32601, "Method not found", id);
+    cJSON_Delete(root);
 }
 
-// Handle client connection
 void handle_client(int client_socket) {
     char buffer[BUFFER_SIZE] = {0};
     int bytes_read = read(client_socket, buffer, BUFFER_SIZE - 1);
@@ -239,15 +320,11 @@ void handle_client(int client_socket) {
         close(client_socket);
         return;
     }
-
     handle_request(client_socket, buffer);
-
-    // Close after one message for simplicity
     close(client_socket);
 }
 
 int main() {
-    // ... (same socket setup as previous)
     int server_socket, client_socket;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_len = sizeof(client_addr);
@@ -278,7 +355,7 @@ int main() {
     }
 
     printf("MCP Server listening on port %d...\n", PORT);
-    printf("Tools: read_file, recursive_file_list, call_llm (integrated with x.ai Grok API)\n");
+    printf("Tools: read_file, recursive_file_list, call_llm (with x.ai Grok API)\n");
     printf("Set XAI_API_KEY environment variable for call_llm.\n");
 
     while (1) {
@@ -287,7 +364,6 @@ int main() {
             perror("Accept failed");
             continue;
         }
-
         handle_client(client_socket);
     }
 
